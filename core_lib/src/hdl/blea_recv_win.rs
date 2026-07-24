@@ -1338,25 +1338,52 @@ impl BleReceiverAdvertiser {
                 // Skipped while paused - there is nothing to recycle, and
                 // restarting here would undo the pause above.
                 if recycle_adv.swap(false, std::sync::atomic::Ordering::Relaxed) && !adv_paused {
-                    let _ = provider.StopAdvertising();
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    match provider.StartAdvertisingWithParameters(&params) {
-                        Ok(()) => {
-                            // Did it actually drop? If subscribers is still 1
-                            // the recycle did not do what it is here to do, and
-                            // the next transfer in either direction will fight
-                            // for the link.
-                            let subs = server_tx
-                                .SubscribedClients()
-                                .and_then(|c| c.Size())
-                                .unwrap_or(0);
-                            info!(
-                                "{INNER_NAME}: recycled the advertisement; subscribers now {subs}"
-                            );
+                    // Recycle only if the phone is *still* on the GATT link.
+                    //
+                    // The recycle exists for one job: drop a phone that stayed
+                    // connected after a transfer, so the next transfer - in
+                    // either direction - starts from a clean link. But
+                    // StopAdvertising is a blunt instrument: it also removes us
+                    // from the phone's discovery, and the phone logs
+                    // onEndpointLost and stops listing us in the share sheet.
+                    //
+                    // When the phone closed the session itself - the normal case,
+                    // and what the log shows ("BLE session closed normally",
+                    // subscribers 0) - there is nothing to drop. Recycling anyway
+                    // dropped nothing and only made us disappear from the chooser
+                    // for the next transfer: issue #17. So look first, and leave
+                    // the advertisement untouched when no subscriber lingers.
+                    let subs = server_tx
+                        .SubscribedClients()
+                        .and_then(|c| c.Size())
+                        .unwrap_or(0);
+                    if subs == 0 {
+                        info!(
+                            "{INNER_NAME}: session ended with no lingering subscriber; \
+                             keeping the advertisement up so the phone keeps listing us"
+                        );
+                    } else {
+                        let _ = provider.StopAdvertising();
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        match provider.StartAdvertisingWithParameters(&params) {
+                            Ok(()) => {
+                                // Did it actually drop? If subscribers is still 1
+                                // the recycle did not do what it is here to do,
+                                // and the next transfer in either direction will
+                                // fight for the link.
+                                let now = server_tx
+                                    .SubscribedClients()
+                                    .and_then(|c| c.Size())
+                                    .unwrap_or(0);
+                                info!(
+                                    "{INNER_NAME}: recycled to drop a lingering subscriber; \
+                                     subscribers now {now}"
+                                );
+                            }
+                            Err(e) => warn!("{INNER_NAME}: could not restart advertising: {e}"),
                         }
-                        Err(e) => warn!("{INNER_NAME}: could not restart advertising: {e}"),
+                        last_status = -1;
                     }
-                    last_status = -1;
                 }
 
                 if let Ok(status) = provider.AdvertisementStatus() {
