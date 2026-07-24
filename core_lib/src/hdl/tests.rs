@@ -242,3 +242,48 @@ fn kat_decrypts_a_frame_the_pixel_encrypted() {
         crate::location_nearby_connections::v1_frame::FrameType::PayloadTransfer
     );
 }
+
+// ---------------------------------------------------------------------------
+// Throughput probe (not a correctness test).
+//
+// The receive path spends most of its wall-clock in AES-256-CBC decrypt. This
+// measures that decrypt in isolation, with no phone and no radio, so the number
+// is deterministic and answers one question: is this build getting AES-NI
+// (hundreds of MB/s to GB/s) or the software fallback (tens of MB/s)?
+//
+// Ignored by default - it is a benchmark, not an assertion. Run it in both
+// profiles and compare:
+//
+//   cargo test -p rqs_lib           aes256_cbc_decrypt_throughput -- --ignored --nocapture
+//   cargo test -p rqs_lib --release aes256_cbc_decrypt_throughput -- --ignored --nocapture
+//
+// A debug build reports software speed; --release (or dev once dependencies are
+// optimized) should report AES-NI speed. That gap is the whole throughput
+// question, settled without a single file transfer.
+// ---------------------------------------------------------------------------
+#[test]
+#[ignore]
+fn aes256_cbc_decrypt_throughput() {
+    let key = [0x11u8; 32];
+    let iv = [0x22u8; 16];
+
+    // Encrypt ~16 MiB once, then time decrypting it repeatedly.
+    let plaintext = vec![0x33u8; 16 * 1024 * 1024];
+    let ciphertext = crate::hdl::aes256_cbc_encrypt(&key, &iv, &plaintext).unwrap();
+
+    let iters = 16; // ~256 MiB decrypted in total
+    let start = std::time::Instant::now();
+    let mut decrypted_bytes = 0usize;
+    for _ in 0..iters {
+        // Use the result (len) so the decrypt cannot be optimised away.
+        decrypted_bytes += crate::hdl::aes256_cbc_decrypt(&key, &iv, &ciphertext)
+            .unwrap()
+            .len();
+    }
+    let secs = start.elapsed().as_secs_f64();
+    let mib = decrypted_bytes as f64 / 1_048_576.0;
+    println!(
+        "aes256-cbc decrypt: {mib:.0} MiB in {secs:.3}s = {:.0} MB/s",
+        mib / secs
+    );
+}
