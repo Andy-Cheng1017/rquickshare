@@ -77,6 +77,101 @@ fn send_wifi_upgrade_enabled() -> bool {
     }
 }
 
+/// Everything the bandwidth upgrade does on the new socket once it is connected,
+/// shared by both media that carry it: send CLIENT_INTRODUCTION, read and verify
+/// CLIENT_INTRODUCTION_ACK, then hand the socket to the transport. The bytes are
+/// medium-agnostic - the phone reads the same frames whether the socket reached
+/// it over WIFI_HOTSPOT or WIFI_LAN - so there is exactly one copy.
+///
+/// Returns `Ok` only when the peer acknowledged the introduction and the socket
+/// was accepted by the transport. Any earlier failure returns `Err`, leaving
+/// `join_ready` false so the caller stays on BLE.
+#[cfg(all(feature = "experimental", target_os = "windows"))]
+async fn introduce_over_upgraded_socket(
+    mut socket: tokio::net::TcpStream,
+    endpoint_id: String,
+    upgrade_tx: tokio::sync::mpsc::UnboundedSender<tokio::net::TcpStream>,
+) -> Result<(), anyhow::Error> {
+    use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
+        ClientIntroduction, EventType,
+    };
+    use crate::location_nearby_connections::BandwidthUpgradeNegotiationFrame;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let intro = location_nearby_connections::OfflineFrame {
+        version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+        v1: Some(location_nearby_connections::V1Frame {
+            r#type: Some(
+                location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation.into(),
+            ),
+            bandwidth_upgrade_negotiation: Some(BandwidthUpgradeNegotiationFrame {
+                event_type: Some(EventType::ClientIntroduction.into()),
+                client_introduction: Some(ClientIntroduction {
+                    endpoint_id: Some(endpoint_id),
+                    supports_disabling_encryption: Some(false),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    };
+    let data = intro.encode_to_vec();
+    socket.write_all(&(data.len() as u32).to_be_bytes()).await?;
+    socket.write_all(&data).await?;
+    socket.flush().await?;
+    info!("Bandwidth upgrade: sent CLIENT_INTRODUCTION");
+
+    let mut len_buf = [0u8; 4];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        socket.read_exact(&mut len_buf),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out waiting for CLIENT_INTRODUCTION_ACK"))??;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > SANE_FRAME_LENGTH as usize {
+        return Err(anyhow!("insane ack frame length {len}"));
+    }
+    let mut frame = vec![0u8; len];
+    socket.read_exact(&mut frame).await?;
+
+    // Check what came back, rather than assuming.
+    //
+    // This used to log "got CLIENT_INTRODUCTION_ACK" on the strength of having
+    // read *some* frame, which made the log worse than useless: it asserted the
+    // peer had accepted the new medium when nothing had been decoded. The peer's
+    // own record of the same transfer said the opposite -
+    // "physicalConnectionClosed() for medium WIFI_HOTSPOT with no corresponding
+    // EstablishedConnection that was previously opened", active medium still BLE,
+    // 98304 bytes received and not one of them over WiFi.
+    //
+    // An upgrade that is not acknowledged must fail here. Failing leaves
+    // `join_ready` false, so the switch never fires and the transfer finishes
+    // over BLE - slow, but a slow transfer is a transfer.
+    let ack = location_nearby_connections::OfflineFrame::decode(&*frame)
+        .map_err(|e| anyhow!("peer's reply on the upgraded socket was not a frame: {e}"))?;
+    let event = ack
+        .v1
+        .as_ref()
+        .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref())
+        .map(|bun| bun.event_type());
+    if event
+        != Some(
+            location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType::ClientIntroductionAck,
+        )
+    {
+        return Err(anyhow!(
+            "peer did not acknowledge the introduction; it replied with {event:?}"
+        ));
+    }
+    info!("Bandwidth upgrade: got CLIENT_INTRODUCTION_ACK");
+
+    if upgrade_tx.send(socket).is_err() {
+        return Err(anyhow!("transport gone, cannot adopt the upgraded socket"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 #[ts(export)]
 pub enum OutboundPayload {
@@ -130,10 +225,18 @@ pub struct OutboundRequest<S> {
     /// finishes, and the send loop keeps streaming over BLE until it does.
     #[cfg(all(feature = "experimental", target_os = "windows"))]
     join_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Whether a join is already running, so a repeated offer doesn't start a
-    /// second one.
+    /// Whether an upgrade attempt is already running, so a repeated offer (or a
+    /// per-file nudge) doesn't start a second one. Covers both upgrade kinds:
+    /// joining the peer's AP (WIFI_HOTSPOT) and a direct LAN connect
+    /// (WIFI_LAN).
     #[cfg(all(feature = "experimental", target_os = "windows"))]
     join_started: bool,
+    /// Whether the running upgrade actually associated the WiFi adapter to the
+    /// peer's AP. Only the WIFI_HOTSPOT path does; the WIFI_LAN path just opens a
+    /// second TCP socket over the existing route. Cleanup disconnects WiFi only
+    /// when this is set, so a LAN upgrade never touches the adapter.
+    #[cfg(all(feature = "experimental", target_os = "windows"))]
+    joined_ap: bool,
     /// The background join task, so it can be aborted if the transfer finishes
     /// before it lands - otherwise a small file completes over BLE while we are
     /// still associating, and the join leaks a WiFi connection into a transfer
@@ -200,6 +303,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             upgraded: false,
             #[cfg(all(feature = "experimental", target_os = "windows"))]
             join_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(all(feature = "experimental", target_os = "windows"))]
+            joined_ap: false,
             #[cfg(all(feature = "experimental", target_os = "windows"))]
             join_started: false,
             #[cfg(all(feature = "experimental", target_os = "windows"))]
@@ -813,16 +918,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                     v1_frame.bandwidth_upgrade_negotiation
                 );
 
-                // The peer is hosting a medium and has given us credentials.
+                // The peer is hosting a medium and has given us the details to
+                // reach it. Two shapes, and we prefer the first:
                 //
-                // This is the direction that actually works: with WiFi off the
-                // phone still brings up its own AP (192.168.49.1, the standard
-                // Android P2P gateway) and offers it - it just needed to see
-                // WIFI_HOTSPOT in the negotiated set, which it did not until we
-                // started answering BandwidthUpgradeRetry. So we join rather
-                // than host.
+                //   WIFI_LAN    - the phone is on the same LAN as us and offers a
+                //                 socket at its LAN address (e.g. 192.168.1.13:
+                //                 58571). We already route to it over Ethernet,
+                //                 so there is no network to join - just a second
+                //                 TCP connection. This is the case that used to
+                //                 stall: the handler only knew about hotspot
+                //                 credentials, so it ignored the LAN offer and
+                //                 kept re-sending UPGRADE_PATH_REQUEST, which the
+                //                 phone rejected ("failed to process
+                //                 UPGRADE_PATH_REQUEST", "Upgrade in progress")
+                //                 while the transfer sat on BLE forever.
+                //
+                //   WIFI_HOTSPOT - with WiFi off the phone brings up its own AP
+                //                 (192.168.49.1, the standard Android P2P gateway)
+                //                 and offers it; we associate to that AP first,
+                //                 then connect. It needed to see WIFI_HOTSPOT in
+                //                 the negotiated set, which it did not until we
+                //                 started answering BandwidthUpgradeRetry.
+                //
+                // Opt-in (see the request block above). Whichever finishes first
+                // wins: if the upgrade lands we switch; if the file finishes
+                // first, cleanup_upgrade aborts it - no size threshold, the
+                // events decide.
                 #[cfg(all(feature = "experimental", target_os = "windows"))]
-                if let Some(creds) = v1_frame
+                if let Some(info) = v1_frame
                     .bandwidth_upgrade_negotiation
                     .as_ref()
                     .filter(|bun| {
@@ -830,14 +953,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                             == location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType::UpgradePathAvailable
                     })
                     .and_then(|bun| bun.upgrade_path_info.as_ref())
-                    .and_then(|info| info.wifi_hotspot_credentials.clone())
                 {
-                    // Opt-in (see the request block above). Whichever finishes
-                    // first wins: if the join lands we switch to WiFi; if the
-                    // file finishes first, cleanup_upgrade aborts the join and
-                    // disconnects WiFi - no size threshold, the events decide.
                     if send_wifi_upgrade_enabled() {
-                        self.spawn_join(creds);
+                        let lan = info.wifi_lan_socket.as_ref().and_then(|s| {
+                            let ip = s.ip_address();
+                            (ip.len() == 4 && s.wifi_port.is_some()).then(|| {
+                                (
+                                    std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
+                                    s.wifi_port() as u16,
+                                )
+                            })
+                        });
+                        if let Some((ip, port)) = lan {
+                            self.spawn_lan_upgrade(ip, port);
+                        } else if let Some(creds) = info.wifi_hotspot_credentials.clone() {
+                            self.spawn_join(creds);
+                        }
                     }
                 }
 
@@ -1277,11 +1408,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                     // Re-nudge the upgrade per file, opt-in. The initial request
                     // is sent once before the loop; this just keeps prompting a
                     // peer that hasn't offered yet, and only when the send-side
-                    // WiFi upgrade is enabled. Never after we've switched
-                    // (`!self.upgraded`) - a negotiation frame in the encrypted
-                    // payload stream wedges the peer.
+                    // WiFi upgrade is enabled. Stop once an upgrade is running
+                    // (`!self.join_started`): the phone has already offered a
+                    // path and is hosting it, so another UPGRADE_PATH_REQUEST is
+                    // the redundant frame it rejects as "Upgrade in progress".
+                    // Never after we've switched (`!self.upgraded`) - a
+                    // negotiation frame in the encrypted payload stream wedges the
+                    // peer.
                     #[cfg(all(feature = "experimental", target_os = "windows"))]
-                    if self.chunk_size < 512 * 1024 && !self.upgraded && send_wifi_upgrade_enabled()
+                    if self.chunk_size < 512 * 1024
+                        && !self.upgraded
+                        && !self.join_started
+                        && send_wifi_upgrade_enabled()
                     {
                         if let Err(e) = self.send_upgrade_path_request().await {
                             warn!("send_upgrade_path_request failed: {e}");
@@ -1820,17 +1958,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
     /// flag and sends LAST_WRITE itself (which needs the encrypted BLE channel),
     /// so the whole thing is event-driven: nothing waits on a fixed timer, and a
     /// slow join simply upgrades later rather than being abandoned.
+    ///
+    /// This path associates the WiFi adapter to the peer's AP, so it sets
+    /// `joined_ap`: cleanup will disconnect the adapter afterwards. The
+    /// WIFI_LAN sibling (`spawn_lan_upgrade`) does not.
     #[cfg(all(feature = "experimental", target_os = "windows"))]
     fn spawn_join(
         &mut self,
         creds: crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::WifiHotspotCredentials,
     ) {
-        use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
-            ClientIntroduction, EventType,
-        };
-        use crate::location_nearby_connections::BandwidthUpgradeNegotiationFrame;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         if self.join_started {
             return;
         }
@@ -1842,6 +1978,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
             return;
         };
         self.join_started = true;
+        self.joined_ap = true;
         let gateway = creds.gateway().to_string();
         let port = creds.port() as u16;
         let endpoint_id = String::from_utf8_lossy(&self.endpoint_id).to_string();
@@ -1865,7 +2002,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
 
                 // The AP can accept the association a beat before its listener
                 // is up, so a single refused connect isn't conclusive.
-                let mut socket = {
+                let socket = {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
                     loop {
                         let why = match tokio::time::timeout(
@@ -1885,81 +2022,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                     }
                 };
 
-                let intro = location_nearby_connections::OfflineFrame {
-                    version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
-                    v1: Some(location_nearby_connections::V1Frame {
-                        r#type: Some(
-                            location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
-                                .into(),
-                        ),
-                        bandwidth_upgrade_negotiation: Some(BandwidthUpgradeNegotiationFrame {
-                            event_type: Some(EventType::ClientIntroduction.into()),
-                            client_introduction: Some(ClientIntroduction {
-                                endpoint_id: Some(endpoint_id),
-                                supports_disabling_encryption: Some(false),
-                            }),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                };
-                let data = intro.encode_to_vec();
-                socket.write_all(&(data.len() as u32).to_be_bytes()).await?;
-                socket.write_all(&data).await?;
-                socket.flush().await?;
-                info!("Bandwidth upgrade: sent CLIENT_INTRODUCTION");
-
-                let mut len_buf = [0u8; 4];
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(15),
-                    socket.read_exact(&mut len_buf),
-                )
-                .await
-                .map_err(|_| anyhow!("timed out waiting for CLIENT_INTRODUCTION_ACK"))??;
-                let len = u32::from_be_bytes(len_buf) as usize;
-                if len == 0 || len > SANE_FRAME_LENGTH as usize {
-                    return Err(anyhow!("insane ack frame length {len}"));
-                }
-                let mut frame = vec![0u8; len];
-                socket.read_exact(&mut frame).await?;
-
-                // Check what came back, rather than assuming.
-                //
-                // This used to log "got CLIENT_INTRODUCTION_ACK" on the strength
-                // of having read *some* frame, which made the log worse than
-                // useless: it asserted the peer had accepted the new medium
-                // when nothing had been decoded. The peer's own record of the
-                // same transfer said the opposite - "physicalConnectionClosed()
-                // for medium WIFI_HOTSPOT with no corresponding
-                // EstablishedConnection that was previously opened", active
-                // medium still BLE, 98304 bytes received and not one of them
-                // over WiFi.
-                //
-                // A join that is not acknowledged must fail here. Failing leaves
-                // `join_ready` false, so the switch never fires and the transfer
-                // finishes over BLE - slow, but a slow transfer is a transfer.
-                let ack = location_nearby_connections::OfflineFrame::decode(&*frame)
-                    .map_err(|e| anyhow!("peer's reply on the upgraded socket was not a frame: {e}"))?;
-                let event = ack
-                    .v1
-                    .as_ref()
-                    .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref())
-                    .map(|bun| bun.event_type());
-                if event
-                    != Some(
-                        location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType::ClientIntroductionAck,
-                    )
-                {
-                    return Err(anyhow!(
-                        "peer did not acknowledge the introduction; it replied with {event:?}"
-                    ));
-                }
-                info!("Bandwidth upgrade: got CLIENT_INTRODUCTION_ACK");
-
-                if upgrade_tx.send(socket).is_err() {
-                    return Err(anyhow!("transport gone, cannot adopt the upgraded socket"));
-                }
-                Ok::<(), anyhow::Error>(())
+                introduce_over_upgraded_socket(socket, endpoint_id, upgrade_tx).await
             };
 
             match run.await {
@@ -1967,6 +2030,72 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
                 // switch. Only on success - a failed join leaves us on BLE.
                 Ok(()) => ready.store(true, std::sync::atomic::Ordering::Relaxed),
                 Err(e) => warn!("Bandwidth upgrade: join failed, staying on BLE: {e}"),
+            }
+        }));
+    }
+
+    /// Take a WIFI_LAN upgrade the peer offered: connect straight to its LAN
+    /// socket and hand the transport the result.
+    ///
+    /// This is the phone-on-WiFi case. The phone hosts a WiFi-LAN listener at its
+    /// own LAN address and sends UPGRADE_PATH_AVAILABLE with that ip:port. We
+    /// already reach it over Ethernet, so unlike `spawn_join` there is nothing to
+    /// associate - just a second TCP connection over the route we have. Because
+    /// no adapter state changes, `joined_ap` stays false and cleanup leaves WiFi
+    /// alone.
+    ///
+    /// Everything after the connect - CLIENT_INTRODUCTION, the ACK, the handoff,
+    /// `join_ready`, and the switch the main loop drives off it - is identical to
+    /// the hotspot path, because the bandwidth-upgrade protocol is the same
+    /// regardless of which medium carries it.
+    #[cfg(all(feature = "experimental", target_os = "windows"))]
+    fn spawn_lan_upgrade(&mut self, ip: std::net::Ipv4Addr, port: u16) {
+        if self.join_started {
+            return;
+        }
+        let Some(upgrade_tx) = self.upgrade_tx.clone() else {
+            return;
+        };
+        self.join_started = true;
+        let endpoint_id = String::from_utf8_lossy(&self.endpoint_id).to_string();
+        let ready = self.join_ready.clone();
+
+        self.join_handle = Some(tokio::spawn(async move {
+            let run = async {
+                info!("Bandwidth upgrade: connecting to the peer's LAN socket {ip}:{port} (background)");
+                // The peer logs "Successfully started listening for incoming Wifi
+                // Lan connections" before it offers, so the listener is normally
+                // already up - but a single refused connect right at the edge of
+                // that isn't conclusive, so retry briefly. A connect that never
+                // lands leaves `join_ready` false and the transfer finishes over
+                // BLE, exactly as a failed AP join does.
+                let addr = std::net::SocketAddr::from((ip, port));
+                let socket = {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        let why = match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            tokio::net::TcpStream::connect(addr),
+                        )
+                        .await
+                        {
+                            Ok(Ok(s)) => break s,
+                            Ok(Err(e)) => e.to_string(),
+                            Err(_) => "connect timed out".to_string(),
+                        };
+                        if std::time::Instant::now() >= deadline {
+                            return Err(anyhow!("could not reach {ip}:{port}: {why}"));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    }
+                };
+
+                introduce_over_upgraded_socket(socket, endpoint_id, upgrade_tx).await
+            };
+
+            match run.await {
+                Ok(()) => ready.store(true, std::sync::atomic::Ordering::Relaxed),
+                Err(e) => warn!("Bandwidth upgrade: LAN connect failed, staying on BLE: {e}"),
             }
         }));
     }
@@ -1982,7 +2111,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> OutboundRequest<S> {
         if let Some(h) = self.join_handle.take() {
             h.abort();
         }
-        if self.join_started {
+        // Only the WIFI_HOTSPOT path touches the adapter; a WIFI_LAN upgrade runs
+        // over the existing route and has nothing to disconnect.
+        if self.joined_ap {
             crate::hdl::wifi_disconnect().await;
         }
     }
